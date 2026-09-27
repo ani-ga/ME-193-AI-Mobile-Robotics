@@ -23,17 +23,27 @@ has to be before it counts.
 Calibration is saved to note_calibration.json next to this script;
 --use-saved skips calibration and reuses it.
 
+Two computers: at startup it asks whether 1 or 2 computers are streaming
+audio. With 2, the "host" laptop is connected to the car and the "remote"
+laptop only listens. Each calibrates its own notes, they swap spectrogram
+frames over MQTT (both screens show both mics), and either person's whistle
+drives the car -- if both play different commands at once, the host wins.
+
 Usage:
     python note_drive.py                  # calibrate, then connect to purple card 0998
     python note_drive.py --use-saved      # reuse the last calibration
     python note_drive.py --no-calibrate   # fixed notes C4/D4/E4/F4 (shift with --octave)
     python note_drive.py --dry-run        # spectrogram + detection, no motors
+    python note_drive.py --link host      # 2 computers: this one drives the car
+    python note_drive.py --link remote    # 2 computers: this one only streams its mic
 """
 
 import argparse
+import base64
 import json
 import queue
 import sys
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -47,6 +57,10 @@ WINDOW_SIZE = 4096       # samples per analysis window (~93 ms): enough resoluti
 FFT_SIZE = 8192          # zero-padded FFT length (~5.4 Hz bins) for a smoother display and finer peaks
 HOP_SIZE = 1024          # samples between frames (~23 ms)
 HISTORY_SECONDS = 5.0    # how much audio the spectrogram shows
+N_COLS = int(HISTORY_SECONDS * SAMPLE_RATE / HOP_SIZE)
+
+# Two-computer streaming
+REMOTE_TIMEOUT = 1.0     # s without teammate messages before their commands are ignored
 
 # Wide search range used while calibrating, before we know which notes you'll use.
 CAL_FREQ_MIN = 80.0
@@ -78,7 +92,9 @@ def parabolic_peak_index(mag, i):
     denom = y0 - 2 * y1 + y2
     if denom == 0:
         return float(i)
-    return i + 0.5 * (y0 - y2) / denom
+    # Clamp: if bin i isn't a true local max the parabola can put the peak
+    # far away (even at a negative frequency).
+    return i + float(np.clip(0.5 * (y0 - y2) / denom, -0.5, 0.5))
 
 
 class PitchDetector:
@@ -340,6 +356,34 @@ def add_common_args(parser):
     parser.add_argument("--release-frames", type=int, default=8, help="Frames of no command note before the car stops (default 8)")
     parser.add_argument("--device", default=None, help="Input device index or name substring (default: system default mic)")
     parser.add_argument("--dry-run", action="store_true", help="Show spectrogram and detections without connecting to the motors")
+    parser.add_argument("--computers", type=int, choices=[1, 2], help="How many computers stream audio (asked at startup if omitted)")
+    parser.add_argument("--link", choices=["host", "remote"],
+                        help="2 computers: 'host' is connected to the car, 'remote' only streams its mic (implies --computers 2)")
+    parser.add_argument("--stream-topic", default=None,
+                        help="2 computers: MQTT topic prefix both laptops share (default ME193/Rogers/stream/<card serial>)")
+
+
+def choose_streaming(args):
+    """Ask, unless given on the command line, whether 1 or 2 computers are
+    streaming audio and, with 2, whether this one is connected to the car."""
+    if args.link:
+        args.computers = 2
+    while args.computers is None:
+        answer = input("How many computers are streaming audio? [1/2] (Enter = 1): ").strip()
+        if answer in ("", "1", "2"):
+            args.computers = int(answer or 1)
+    while args.computers == 2 and args.link is None:
+        answer = input("Is THIS computer connected to the robot over Bluetooth? [y/n]: ").strip().lower()
+        if answer in ("y", "yes", "n", "no"):
+            args.link = "host" if answer.startswith("y") else "remote"
+    if args.stream_topic is None:
+        args.stream_topic = f"ME193/Rogers/stream/{args.card_serial}"
+    if args.computers == 2:
+        if args.link == "host":
+            print("Two computers: this laptop drives the car; the teammate's whistles are relayed over MQTT.")
+        else:
+            print("Two computers: this laptop only streams its mic; the teammate's laptop drives the car.")
+        print(f"  Both laptops must use the same stream topic: {args.stream_topic}")
 
 
 def parse_card_color(name):
@@ -387,20 +431,178 @@ def focus_on_notes(detector, notes, args):
           f"louder than {detector.min_level_db:.1f} dBFS.")
 
 
+def format_pitch(freq):
+    if freq is None or np.isnan(freq):
+        return "   --"
+    return f"{freq:6.1f} Hz ({freq_to_note(freq)})"
+
+
+class SpectrogramPanel:
+    """One scrolling spectrogram with its note bands and detected-pitch line."""
+
+    def __init__(self, fig, ax, title=None):
+        self.ax = ax
+        if title:
+            ax.set_title(title, loc="left", fontsize=11, fontweight="bold")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Frequency (Hz)")
+        self.spectrogram = np.full((1, N_COLS), -120.0)
+        self.pitch_history = np.full(N_COLS, np.nan)
+        self.image = ax.imshow(self.spectrogram, origin="lower", aspect="auto", cmap="magma",
+                               extent=[-HISTORY_SECONDS, 0, 0, 1], vmin=-100, vmax=-20, interpolation="bilinear")
+        fig.colorbar(self.image, ax=ax, label="Magnitude (dBFS)")
+        (self.pitch_line,) = ax.plot(np.linspace(-HISTORY_SECONDS, 0, N_COLS), self.pitch_history,
+                                     color="white", lw=2, marker=".", ms=3, zorder=3)
+        self.status_text = ax.text(0.01, 0.97, "", transform=ax.transAxes, color="white", fontsize=14,
+                                   fontweight="bold", va="top", zorder=4,
+                                   bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"))
+        self.decor = []   # band shading and labels, redrawn by configure()
+        self.bands = {}
+        self.config = None
+
+    def configure(self, notes, tolerance, display_max_hz, band, n_bins):
+        """Draw the note bands. Called once for this laptop's mic, and again
+        for the teammate's whenever their calibration changes."""
+        config = (tuple(sorted(notes.items())), tolerance, display_max_hz, tuple(band), n_bins)
+        if config == self.config:
+            return
+        self.config = config
+        for artist in self.decor:
+            artist.remove()
+        self.decor, self.bands = [], {}
+        self.spectrogram = np.full((n_bins, N_COLS), -120.0)
+        self.image.set_data(self.spectrogram)
+        self.image.set_extent([-HISTORY_SECONDS, 0, 0, display_max_hz])
+        ax = self.ax
+        ax.set_ylim(0, display_max_hz)
+
+        # Grey out frequencies the band-pass ignores.
+        self.decor.append(ax.axhspan(0, band[0], color="black", alpha=0.35, lw=0))
+        self.decor.append(ax.axhspan(band[1], display_max_hz, color="black", alpha=0.35, lw=0))
+        for cmd, center in notes.items():
+            color = COMMAND_COLORS.get(cmd, "white")
+            self.bands[cmd] = ax.axhspan(center - tolerance, center + tolerance, color=color, alpha=0.15, lw=0)
+            label = ax.text(-0.05, center, f"{freq_to_note(center)} {cmd}", color=color, fontsize=9,
+                            fontweight="bold", ha="right", va="center")
+            self.decor += [self.bands[cmd], label]
+
+    def push(self, cols, pitches):
+        """Scroll in new spectrum columns and their detected pitches (NaN = none)."""
+        k = min(len(cols), N_COLS)
+        if k == 0:
+            return
+        self.spectrogram = np.roll(self.spectrogram, -k, axis=1)
+        self.spectrogram[:, -k:] = np.asarray(cols[-k:]).T
+        self.pitch_history = np.roll(self.pitch_history, -k)
+        self.pitch_history[-k:] = pitches[-k:]
+        self.image.set_data(self.spectrogram)
+        # Track loudness so the colors stay readable, but don't amplify silence.
+        top = max(self.spectrogram.max(), -50.0)
+        self.image.set_clim(top - 70, top)
+        self.pitch_line.set_ydata(self.pitch_history)
+
+    def highlight(self, cmd):
+        for name, band in self.bands.items():
+            band.set_alpha(0.45 if name == cmd else 0.12)
+
+    def set_status(self, text, color="white"):
+        self.status_text.set_text(text)
+        self.status_text.set_color(color)
+
+
+class AudioLink:
+    """Two-computer mode: sends this laptop's spectrogram frames and detected
+    command to the teammate's laptop over MQTT, and receives theirs.
+
+    Spectra are quantized to 0.5 dB steps (one byte per bin) and base64'd,
+    which keeps each laptop's stream around 20-30 KB/s."""
+
+    def __init__(self, topic, is_host):
+        root = str(Path(__file__).resolve().parent.parent)   # mqttlib lives in the repo root
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from mqttlib import BROKER, MQTTClient
+
+        me, other = ("host", "remote") if is_host else ("remote", "host")
+        self.out_topic = f"{topic}/{me}"
+        self.in_topic = f"{topic}/{other}"
+        self.inbox = queue.Queue()   # raw payloads from paho's thread
+        self.latest = None           # last message from the teammate
+        self.last_pitch = None
+        self.last_heard = None       # time.monotonic() of that message
+        print(f"Connecting to MQTT broker {BROKER} for audio streaming...")
+        self.client = MQTTClient()
+        self.client.__enter__()
+        self.client.subscribe(self.in_topic, lambda topic, payload: self.inbox.put(payload))
+
+    def send(self, cols, pitches, cmd, info):
+        spec = np.clip(np.round((np.asarray(cols, dtype=float).reshape(len(cols), -1) + 127.5) * 2), 0, 255)
+        msg = dict(info, cmd=cmd, k=len(cols),
+                   spec=base64.b64encode(spec.astype(np.uint8).tobytes()).decode("ascii"),
+                   pitch=[None if np.isnan(p) else round(float(p), 1) for p in pitches])
+        self.client.publish(self.out_topic, json.dumps(msg))
+
+    def receive(self):
+        """Decode every teammate message that arrived since the last call."""
+        msgs = []
+        while True:
+            try:
+                payload = self.inbox.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                msg = json.loads(payload)
+                spec = np.frombuffer(base64.b64decode(msg["spec"]), dtype=np.uint8)
+                msg["cols"] = spec.reshape(msg["k"], msg["n_bins"]) / 2.0 - 127.5
+                msg["pitch"] = [np.nan if p is None else p for p in msg["pitch"]]
+            except (ValueError, KeyError, TypeError):
+                continue   # garbled, or something else published on the topic
+            msgs.append(msg)
+            self.latest, self.last_heard = msg, time.monotonic()
+            if msg["k"]:
+                self.last_pitch = msg["pitch"][-1]
+        return msgs
+
+    @property
+    def connected(self):
+        return self.last_heard is not None and time.monotonic() - self.last_heard < REMOTE_TIMEOUT
+
+    def teammate_cmd(self):
+        return self.latest["cmd"] if self.connected else None
+
+    def close(self):
+        self.client.__exit__(None, None, None)
+
+
 def run_live(detector, notes, car, args, game=None):
     """Listen, drive and show the live spectrogram until the window is closed.
 
     `game` is optional (see world_cup.py): game.step(heard_cmd) is called on
     every screen update and returns the command the car should actually do,
-    and game.status() returns (text, color) for an extra status box."""
+    and game.status() returns (text, color) for an extra status box.
+
+    With args.computers == 2 a second panel shows the teammate's mic. On the
+    host the car obeys this laptop's note, or else the teammate's; the remote
+    never drives and just shows what the host's car is doing."""
     mapper = NoteMapper(notes, args.tolerance, args.confirm_frames, args.release_frames)
     display_max_hz = max(notes.values()) * 2.5
-
-    # ---- Rolling buffers ----
-    n_cols = int(HISTORY_SECONDS * SAMPLE_RATE / HOP_SIZE)
     disp_bins = np.where(detector.freqs <= display_max_hz)[0]
-    spectrogram = np.full((len(disp_bins), n_cols), -120.0)
-    pitch_history = np.full(n_cols, np.nan)
+    two = getattr(args, "computers", 1) == 2
+    is_host = not two or args.link == "host"
+
+    link = None
+    if two:
+        try:
+            link = AudioLink(args.stream_topic, is_host)
+        except OSError as exc:
+            car.close()
+            if game is not None:
+                game.close()
+            sys.exit(f"Could not connect to the MQTT broker for streaming: {exc}")
+    info = {"notes": notes, "tol": args.tolerance, "max_hz": display_max_hz,
+            "band": [detector.freq_min, detector.freq_max], "n_bins": len(disp_bins)}
+
+    # ---- Audio buffers ----
     audio_queue = queue.Queue()
     pending = np.zeros(0, dtype=np.float32)   # samples not yet consumed by a hop
     window_buf = np.zeros(WINDOW_SIZE, dtype=np.float32)
@@ -413,39 +615,25 @@ def run_live(detector, notes, car, args, game=None):
         return None, pyaudio.paContinue
 
     # ---- Figure ----
-    fig, ax = plt.subplots(figsize=(12, 6))
-    image = ax.imshow(
-        spectrogram, origin="lower", aspect="auto", cmap="magma",
-        extent=[-HISTORY_SECONDS, 0, 0, display_max_hz], vmin=-100, vmax=-20, interpolation="bilinear",
-    )
-    fig.colorbar(image, ax=ax, label="Magnitude (dBFS)")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Frequency (Hz)")
-    ax.set_ylim(0, display_max_hz)
-
-    # Grey out frequencies the band-pass ignores.
-    ax.axhspan(0, detector.freq_min, color="black", alpha=0.35, lw=0)
-    ax.axhspan(detector.freq_max, display_max_hz, color="black", alpha=0.35, lw=0)
-
-    bands = {}
-    for cmd, center in notes.items():
-        color = COMMAND_COLORS[cmd]
-        bands[cmd] = ax.axhspan(center - args.tolerance, center + args.tolerance, color=color, alpha=0.15, lw=0)
-        ax.text(-0.05, center, f"{freq_to_note(center)} {cmd}", color=color, fontsize=9, fontweight="bold",
-                ha="right", va="center")
-    (pitch_line,) = ax.plot(np.linspace(-HISTORY_SECONDS, 0, n_cols), pitch_history,
-                            color="white", lw=2, marker=".", ms=3)
-    status_text = ax.text(0.01, 0.97, "", transform=ax.transAxes, color="white", fontsize=14,
-                          fontweight="bold", va="top",
-                          bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"))
+    fig, axes = plt.subplots(2 if two else 1, 1, figsize=(12, 9 if two else 6), squeeze=False)
+    local_title, mate_title = None, None
+    if two:
+        local_title = "This computer (drives the car)" if is_host else "This computer (remote mic)"
+        mate_title = "Teammate (remote mic)" if is_host else "Teammate (drives the car)"
+    local = SpectrogramPanel(fig, axes[0, 0], local_title)
+    local.configure(notes, args.tolerance, display_max_hz, info["band"], len(disp_bins))
+    mate = None
+    if two:
+        mate = SpectrogramPanel(fig, axes[1, 0], mate_title)
+        mate.set_status(f"Waiting for teammate on {link.in_topic}...")
     game_text = None
-    if game is not None:
-        game_text = ax.text(0.99, 0.97, "", transform=ax.transAxes, color="white", fontsize=14,
-                            fontweight="bold", va="top", ha="right",
-                            bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"))
+    if game is not None or not is_host:   # the remote shows the host's game status
+        game_text = axes[0, 0].text(0.99, 0.97, "", transform=axes[0, 0].transAxes, color="white", fontsize=14,
+                                    fontweight="bold", va="top", ha="right", zorder=4,
+                                    bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"))
 
     def update(_):
-        nonlocal pending, spectrogram, pitch_history
+        nonlocal pending
         chunks = []
         while True:
             try:
@@ -467,34 +655,50 @@ def run_live(detector, notes, car, args, game=None):
             state["cmd"] = mapper.update(freq)
             new_cols.append(spec_db[disp_bins])
             new_pitches.append(np.nan if freq is None else freq)
-
-        if new_cols:
-            k = min(len(new_cols), n_cols)
-            spectrogram = np.roll(spectrogram, -k, axis=1)
-            spectrogram[:, -k:] = np.array(new_cols[-k:]).T
-            pitch_history = np.roll(pitch_history, -k)
-            pitch_history[-k:] = new_pitches[-k:]
-
-            image.set_data(spectrogram)
-            # Track loudness so the colors stay readable, but don't amplify silence.
-            top = max(spectrogram.max(), -50.0)
-            image.set_clim(top - 70, top)
-            pitch_line.set_ydata(pitch_history)
-
+        local.push(new_cols, new_pitches)
         freq, cmd = state["freq"], state["cmd"]
-        drive = game.step(cmd) if game is not None else cmd
-        car.command(drive)
 
-        for name, band in bands.items():
-            band.set_alpha(0.45 if name == cmd else 0.12)
-        heard = f"{freq:6.1f} Hz ({freq_to_note(freq)})" if freq else "   --"
-        status_text.set_text(f"Heard: {heard}    Car: {drive or 'STOP'}")
-        status_text.set_color(COMMAND_COLORS.get(drive, "white"))
+        mate_cmd = None
+        if link is not None:
+            for msg in link.receive():
+                mate.configure(msg["notes"], msg["tol"], msg["max_hz"], msg["band"], msg["n_bins"])
+                mate.push(msg["cols"], msg["pitch"])
+            mate_cmd = link.teammate_cmd()
+
+        game_status = None
+        if is_host:
+            heard = cmd or mate_cmd   # this laptop wins when both play a note
+            drive = game.step(heard) if game is not None else heard
+            car.command(drive)
+            car_text = drive or "STOP"
+            if game is not None:
+                game_status = game.status()
+        else:
+            host = link.latest if link.connected else None
+            drive = host.get("drive") if host else None
+            car_text = (drive or "STOP") if host else "(host offline)"
+            if host and host.get("status"):
+                game_status = tuple(host["status"])
+
+        if link is not None:
+            link.send(new_cols, new_pitches, cmd,
+                      dict(info, drive=drive if is_host else None, status=game_status))
+            if link.connected:
+                mate.highlight(mate_cmd)
+                mate.set_status(f"Teammate heard: {format_pitch(link.last_pitch)}    -> {mate_cmd or '--'}",
+                                COMMAND_COLORS.get(mate_cmd, "white"))
+            else:
+                mate.highlight(None)
+                mate.set_status(f"Waiting for teammate on {link.in_topic}...")
+
+        local.highlight(cmd)
+        local.set_status(f"Heard: {format_pitch(freq)}    Car: {car_text}", COMMAND_COLORS.get(drive, "white"))
         if game_text is not None:
-            text, color = game.status()
+            text, color = game_status or ("", "white")
             game_text.set_text(text)
             game_text.set_color(color)
-        return image, pitch_line, status_text
+            game_text.set_visible(bool(text))
+        return []
 
     pa = pyaudio.PyAudio()
     stream = None
@@ -519,6 +723,8 @@ def run_live(detector, notes, car, args, game=None):
         car.close()
         if game is not None:
             game.close()
+        if link is not None:
+            link.close()
         print('Closing...')
 
 
@@ -526,6 +732,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_args(parser)
     args = parser.parse_args()
+    choose_streaming(args)
 
     card_color = parse_card_color(args.card_color) if args.card_color else None
     args.device = resolve_device(args.device)
@@ -534,7 +741,8 @@ def main():
     notes = load_or_calibrate(detector, args)
     focus_on_notes(detector, notes, args)
 
-    car = Car(card_color, args.card_serial, args.speed, args.turn_speed, args.dry_run)
+    # The remote laptop never connects to the car; the host drives it.
+    car = Car(card_color, args.card_serial, args.speed, args.turn_speed, args.dry_run or args.link == "remote")
     run_live(detector, notes, car, args)
 
 

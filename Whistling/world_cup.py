@@ -237,6 +237,7 @@ def main():
         return
     if args.role is None:
         parser.error("--role ball or --role goalie is required")
+    nd.choose_streaming(args)
 
     commands = nd.COMMANDS + (["GOAL"] if args.role == "ball" else [])
     card_color = nd.parse_card_color(args.card_color) if args.card_color else None
@@ -245,6 +246,13 @@ def main():
     detector = nd.PitchDetector(nd.CAL_FREQ_MIN, nd.CAL_FREQ_MAX, args.min_level_db, args.min_prominence_db)
     notes = nd.load_or_calibrate(detector, args, commands, CALIBRATION_FILE)
     nd.focus_on_notes(detector, notes, args)
+
+    if args.link == "remote":
+        # Just a second mic: the host laptop runs the car, sensor and game,
+        # and its game status shows up on this screen.
+        car = nd.Car(card_color, args.card_serial, args.speed, args.turn_speed, dry_run=True)
+        nd.run_live(detector, notes, car, args)
+        return
 
     car = nd.Car(card_color, args.card_serial, args.speed, args.turn_speed, args.dry_run)
     sensor = None

@@ -1,4 +1,11 @@
 legoeducation==1.1.1
+matplotlib==3.11.1
 mediapipe==0.10.35
+numpy==2.5.3
 opencv-python==5.0.0.93
 paho-mqtt==2.1.0
+pyaudio==0.2.14; python_version < "3.14"
+# No official PyAudio wheel for Windows + Python 3.14; this fork has the same API
+# but imports as pyaudiowpatch, so add a pyaudio.py alias in site-packages.
+pyaudiowpatch==0.2.12.8; sys_platform == "win32" and python_version >= "3.14"
+sounddevice==0.5.6

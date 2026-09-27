@@ -100,6 +100,33 @@ Just drive, with no game at all:
 
 
 --------------------------------------------------------------
+4b. TWO COMPUTERS STREAMING AUDIO
+--------------------------------------------------------------
+
+At startup it asks "How many computers are streaming audio?".
+Answer 2 on both laptops, then:
+
+  HOST   = the laptop connected to the car (and light sensor).
+           Runs the game. Either person's whistle drives the car;
+           if both whistle different notes, the host's note wins.
+  REMOTE = the other laptop. Only listens to its mic -- no
+           Bluetooth. Shows the car's command and game status.
+
+Both screens show two spectrograms: this mic (top) and the
+teammate's mic (bottom). Each laptop calibrates its own notes.
+
+Skip the questions with:
+
+  python Whistling/world_cup.py --role ball --use-saved --link host
+  python Whistling/world_cup.py --role ball --use-saved --link remote
+
+Use the same --role on both laptops (ball, so the remote can
+also whistle GOAL). Both must use the same --card-serial (the
+stream topic is ME193/Rogers/stream/<card serial>).
+Only the host needs to hear "start".
+
+
+--------------------------------------------------------------
 5. USEFUL OPTIONS (add to any command above)
 --------------------------------------------------------------
 
