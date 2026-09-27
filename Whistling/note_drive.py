@@ -38,7 +38,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import sounddevice as sd
+import pyaudio
 from matplotlib.animation import FuncAnimation
 
 # ---- Audio / STFT settings ----
@@ -137,11 +137,32 @@ def frames(signal):
         yield signal[start:start + WINDOW_SIZE]
 
 
+def resolve_device(device):
+    """Turn --device (an index or a name substring) into a PyAudio input device index."""
+    if device is None or str(device).isdigit():
+        return None if device is None else int(device)
+    pa = pyaudio.PyAudio()
+    try:
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if info["maxInputChannels"] > 0 and device.lower() in info["name"].lower():
+                return i
+    finally:
+        pa.terminate()
+    sys.exit(f"No input device matching '{device}'.")
+
+
 def record(seconds, device):
-    audio = sd.rec(int(seconds * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1,
-                   dtype="float32", device=device)
-    sd.wait()
-    return audio[:, 0]
+    pa = pyaudio.PyAudio()
+    try:
+        stream = pa.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE, input=True,
+                         input_device_index=device, frames_per_buffer=HOP_SIZE)
+        data = stream.read(int(seconds * SAMPLE_RATE), exception_on_overflow=False)
+        stream.stop_stream()
+        stream.close()
+    finally:
+        pa.terminate()
+    return np.frombuffer(data, dtype=np.float32)
 
 
 def calibrate_noise(detector, seconds, device):
@@ -173,14 +194,14 @@ def calibrate_note(detector, cmd, seconds, device):
     return center, spread
 
 
-def run_calibration(detector, args):
+def run_calibration(detector, args, commands=COMMANDS):
     noise_db = calibrate_noise(detector, args.record_seconds, args.device)
     detector.min_level_db = max(args.min_level_db, noise_db + NOISE_MARGIN_DB)
 
-    print("\nNow record one note per direction. Pick notes at least a couple of "
+    print("\nNow record one note per command. Pick notes at least a couple of "
           f"semitones apart (ranges are +/-{args.tolerance:g} Hz).")
     notes = {}
-    for cmd in COMMANDS:
+    for cmd in commands:
         while True:
             result = calibrate_note(detector, cmd, args.record_seconds, args.device)
             if result is None:
@@ -303,13 +324,12 @@ class Car:
             self.motor = None
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_common_args(parser):
     parser.add_argument("--card-color", default="PURPLE", help="Double Motor connection card color (default PURPLE)")
     parser.add_argument("--card-serial", default="0998", help="Double Motor connection card serial number (default 0998)")
     parser.add_argument("--speed", type=int, default=40, help="Forward/backward speed percent (default 40)")
     parser.add_argument("--turn-speed", type=int, default=30, help="Turn-in-place speed percent (default 30)")
-    parser.add_argument("--use-saved", action="store_true", help=f"Skip calibration and reuse {CALIBRATION_FILE.name}")
+    parser.add_argument("--use-saved", action="store_true", help="Skip calibration and reuse the saved calibration file")
     parser.add_argument("--no-calibrate", action="store_true", help="Skip calibration and use fixed notes C4/D4/E4/F4")
     parser.add_argument("--octave", type=int, default=0, help="With --no-calibrate: shift the fixed notes by this many octaves (default 0)")
     parser.add_argument("--record-seconds", type=float, default=1.0, help="Length of each calibration recording (default 1.0)")
@@ -320,45 +340,45 @@ def main():
     parser.add_argument("--release-frames", type=int, default=8, help="Frames of no command note before the car stops (default 8)")
     parser.add_argument("--device", default=None, help="Input device index or name substring (default: system default mic)")
     parser.add_argument("--dry-run", action="store_true", help="Show spectrogram and detections without connecting to the motors")
-    args = parser.parse_args()
 
-    card_color = None
-    if args.card_color:
-        import legoeducation as le
-        attr = f"LEGO_COLOR_{args.card_color.upper()}"
-        if not hasattr(le, attr):
-            sys.exit(f"Unknown card color '{args.card_color}'.")
-        card_color = getattr(le, attr)
-    if args.device is not None and args.device.isdigit():
-        args.device = int(args.device)
 
-    detector = PitchDetector(CAL_FREQ_MIN, CAL_FREQ_MAX, args.min_level_db, args.min_prominence_db)
+def parse_card_color(name):
+    import legoeducation as le
+    attr = f"LEGO_COLOR_{name.upper()}"
+    if not hasattr(le, attr):
+        sys.exit(f"Unknown card color '{name}'.")
+    return getattr(le, attr)
 
+
+def load_or_calibrate(detector, args, commands=COMMANDS, cal_file=CALIBRATION_FILE):
+    """Return {command: Hz} from the fixed notes, a saved file or a fresh calibration."""
     try:
         if args.no_calibrate:
-            notes = {cmd: f * 2 ** args.octave for cmd, f in DEFAULT_NOTES.items()}
-        elif args.use_saved:
-            if not CALIBRATION_FILE.exists():
-                sys.exit(f"No saved calibration at {CALIBRATION_FILE}; run without --use-saved first.")
-            saved = json.loads(CALIBRATION_FILE.read_text())
-            notes = saved["notes"]
+            return {cmd: DEFAULT_NOTES[cmd] * 2 ** args.octave for cmd in commands}
+        if args.use_saved:
+            if not cal_file.exists():
+                sys.exit(f"No saved calibration at {cal_file}; run without --use-saved first.")
+            saved = json.loads(cal_file.read_text())
+            missing = [cmd for cmd in commands if cmd not in saved["notes"]]
+            if missing:
+                sys.exit(f"{cal_file.name} has no note for {', '.join(missing)}; run without --use-saved.")
             detector.min_level_db = saved["min_level_db"]
-        else:
-            notes, min_level_db = run_calibration(detector, args)
-            CALIBRATION_FILE.write_text(json.dumps({"notes": notes, "min_level_db": min_level_db}, indent=2))
-            print(f"\nSaved calibration to {CALIBRATION_FILE.name}.")
-    except sd.PortAudioError as exc:
+            return {cmd: saved["notes"][cmd] for cmd in commands}
+        notes, min_level_db = run_calibration(detector, args, commands)
+        cal_file.write_text(json.dumps({"notes": notes, "min_level_db": min_level_db}, indent=2))
+        print(f"\nSaved calibration to {cal_file.name}.")
+        return notes
+    except OSError as exc:
         sys.exit(f"Could not open the microphone: {exc}")
     except KeyboardInterrupt:
         sys.exit("\nCalibration cancelled.")
 
-    mapper = NoteMapper(notes, args.tolerance, args.confirm_frames, args.release_frames)
 
-    # Band-pass: only look for pitch just around the calibrated notes.
+def focus_on_notes(detector, notes, args):
+    """Band-pass: only look for pitch just around the calibrated notes."""
     search_min = min(notes.values()) - 2 * args.tolerance
     search_max = max(notes.values()) + 2 * args.tolerance
     detector.set_band(max(CAL_FREQ_MIN, search_min), search_max)
-    display_max_hz = max(notes.values()) * 2.5
 
     print("\nNote map:")
     for cmd, center in notes.items():
@@ -366,7 +386,15 @@ def main():
     print(f"Listening for pitch between {detector.freq_min:.0f} and {detector.freq_max:.0f} Hz, "
           f"louder than {detector.min_level_db:.1f} dBFS.")
 
-    car = Car(card_color, args.card_serial, args.speed, args.turn_speed, args.dry_run)
+
+def run_live(detector, notes, car, args, game=None):
+    """Listen, drive and show the live spectrogram until the window is closed.
+
+    `game` is optional (see world_cup.py): game.step(heard_cmd) is called on
+    every screen update and returns the command the car should actually do,
+    and game.status() returns (text, color) for an extra status box."""
+    mapper = NoteMapper(notes, args.tolerance, args.confirm_frames, args.release_frames)
+    display_max_hz = max(notes.values()) * 2.5
 
     # ---- Rolling buffers ----
     n_cols = int(HISTORY_SECONDS * SAMPLE_RATE / HOP_SIZE)
@@ -378,10 +406,11 @@ def main():
     window_buf = np.zeros(WINDOW_SIZE, dtype=np.float32)
     state = {"freq": None, "cmd": None}
 
-    def audio_callback(indata, frame_count, time_info, status):
+    def audio_callback(in_data, frame_count, time_info, status):
         if status:
-            print(status, file=sys.stderr)
-        audio_queue.put(indata[:, 0].copy())
+            print(f"Audio status flag {status}", file=sys.stderr)
+        audio_queue.put(np.frombuffer(in_data, dtype=np.float32).copy())
+        return None, pyaudio.paContinue
 
     # ---- Figure ----
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -409,6 +438,11 @@ def main():
     status_text = ax.text(0.01, 0.97, "", transform=ax.transAxes, color="white", fontsize=14,
                           fontweight="bold", va="top",
                           bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"))
+    game_text = None
+    if game is not None:
+        game_text = ax.text(0.99, 0.97, "", transform=ax.transAxes, color="white", fontsize=14,
+                            fontweight="bold", va="top", ha="right",
+                            bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"))
 
     def update(_):
         nonlocal pending, spectrogram, pitch_history
@@ -440,7 +474,6 @@ def main():
             spectrogram[:, -k:] = np.array(new_cols[-k:]).T
             pitch_history = np.roll(pitch_history, -k)
             pitch_history[-k:] = new_pitches[-k:]
-            car.command(state["cmd"])
 
             image.set_data(spectrogram)
             # Track loudness so the colors stay readable, but don't amplify silence.
@@ -448,30 +481,61 @@ def main():
             image.set_clim(top - 70, top)
             pitch_line.set_ydata(pitch_history)
 
-        for cmd, band in bands.items():
-            band.set_alpha(0.45 if cmd == state["cmd"] else 0.12)
         freq, cmd = state["freq"], state["cmd"]
+        drive = game.step(cmd) if game is not None else cmd
+        car.command(drive)
+
+        for name, band in bands.items():
+            band.set_alpha(0.45 if name == cmd else 0.12)
         heard = f"{freq:6.1f} Hz ({freq_to_note(freq)})" if freq else "   --"
-        status_text.set_text(f"Heard: {heard}    Car: {cmd or 'STOP'}")
-        status_text.set_color(COMMAND_COLORS.get(cmd, "white"))
+        status_text.set_text(f"Heard: {heard}    Car: {drive or 'STOP'}")
+        status_text.set_color(COMMAND_COLORS.get(drive, "white"))
+        if game_text is not None:
+            text, color = game.status()
+            game_text.set_text(text)
+            game_text.set_color(color)
         return image, pitch_line, status_text
 
-    stream = sd.InputStream(samplerate=SAMPLE_RATE, blocksize=HOP_SIZE, channels=1,
-                            dtype="float32", callback=audio_callback, device=args.device)
+    pa = pyaudio.PyAudio()
+    stream = None
     try:
-        with stream:
-            anim = FuncAnimation(fig, update, interval=40, blit=False, cache_frame_data=False)
-            fig.tight_layout()
-            print("Listening... close the plot window (or Ctrl+C) to stop.")
-            plt.show()
-            del anim
-    except sd.PortAudioError as exc:
+        stream = pa.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE, input=True,
+                         input_device_index=args.device, frames_per_buffer=HOP_SIZE,
+                         stream_callback=audio_callback)
+        anim = FuncAnimation(fig, update, interval=40, blit=False, cache_frame_data=False)
+        fig.tight_layout()
+        print("Listening... close the plot window (or Ctrl+C) to stop.")
+        plt.show()
+        del anim
+    except OSError as exc:
         sys.exit(f"Could not open the microphone: {exc}")
     except KeyboardInterrupt:
         pass
     finally:
+        if stream is not None:
+            stream.stop_stream()
+            stream.close()
+        pa.terminate()
         car.close()
+        if game is not None:
+            game.close()
         print('Closing...')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_common_args(parser)
+    args = parser.parse_args()
+
+    card_color = parse_card_color(args.card_color) if args.card_color else None
+    args.device = resolve_device(args.device)
+
+    detector = PitchDetector(CAL_FREQ_MIN, CAL_FREQ_MAX, args.min_level_db, args.min_prominence_db)
+    notes = load_or_calibrate(detector, args)
+    focus_on_notes(detector, notes, args)
+
+    car = Car(card_color, args.card_serial, args.speed, args.turn_speed, args.dry_run)
+    run_live(detector, notes, car, args)
 
 
 if __name__ == "__main__":

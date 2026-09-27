@@ -1,0 +1,179 @@
+==============================================================
+  WHISTLE WORLD CUP -- HOW TO PLAY (BALL / SCORER or GOALIE)
+==============================================================
+
+Drive the LEGO car by whistling. The game starts when the message
+"start" arrives over MQTT on the topic ME193/Rogers.
+
+  BALL (scorer): drive into the goal, then hold your GOAL note for
+                 1 second to score. If the goalie gets close to your
+                 light sensor, you lose.
+  GOALIE:        get close to the ball's light sensor to win.
+
+At the end, each laptop plays a song automatically:
+  Ball scores       -> ball plays SUCCESS song, goalie plays DEATH song
+  Goalie catches it -> ball plays DEATH song,   goalie plays SUCCESS song
+
+
+--------------------------------------------------------------
+0. EVERY NEW TERMINAL -- RUN THESE FIRST
+--------------------------------------------------------------
+
+  cd "/Users/anigregoriasadourian/Desktop/Tufts Fall '26/ME193/GITHUB/ME-193-AI-Mobile-Robotics"
+  source venv/bin/activate
+
+  (You should see "(venv)" at the start of the prompt.)
+
+
+--------------------------------------------------------------
+1. PLAY AS THE BALL (SCORER)
+--------------------------------------------------------------
+
+First time (calibrate 5 notes: FORWARD, LEFT, RIGHT, BACKWARD, GOAL):
+
+  python Whistling/world_cup.py --role ball
+
+After that (reuse your saved notes):
+
+  python Whistling/world_cup.py --role ball --use-saved
+
+What happens:
+  - It connects to the car and the light sensor (card PURPLE 0998).
+  - Keep the space in front of the light sensor clear for 1 second
+    while it measures the baseline.
+  - The box at the top right of the plot says BALL | WAITING.
+  - Whistles are ignored until "start" arrives.
+  - After start: whistle to drive. Hold GOAL for 1 second in the goal
+    to score.
+
+
+--------------------------------------------------------------
+2. PLAY AS THE GOALIE
+--------------------------------------------------------------
+
+First time (calibrate 4 notes: FORWARD, LEFT, RIGHT, BACKWARD):
+
+  python Whistling/world_cup.py --role goalie
+
+After that:
+
+  python Whistling/world_cup.py --role goalie --use-saved
+
+What happens:
+  - It connects to the car (no light sensor needed).
+  - It waits for "start", then you whistle to drive.
+  - It wins or loses automatically when the ball's laptop sends its
+    result.
+
+
+--------------------------------------------------------------
+3. START THE GAME (if no one else sends "start")
+--------------------------------------------------------------
+
+Open a SECOND terminal (do step 0 in it), then:
+
+  python Whistling/world_cup.py --send start
+
+
+--------------------------------------------------------------
+4. TESTING WITHOUT AN OPPONENT
+--------------------------------------------------------------
+
+No car at all (just the plot and the game logic):
+
+  python Whistling/world_cup.py --role ball --dry-run
+  python Whistling/world_cup.py --role goalie --dry-run
+
+Ball with the car but without the light sensor:
+
+  python Whistling/world_cup.py --role ball --use-saved --no-sensor
+
+Pretend to be the other laptop (run in a second terminal):
+
+  python Whistling/world_cup.py --send start          # start the game
+  python Whistling/world_cup.py --send ball_caught    # goalie wins
+  python Whistling/world_cup.py --send ball_scored    # ball wins
+
+Just drive, with no game at all:
+
+  python Whistling/note_drive.py --use-saved
+
+
+--------------------------------------------------------------
+5. USEFUL OPTIONS (add to any command above)
+--------------------------------------------------------------
+
+  --card-color RED --card-serial 1234
+        Car on a different connection card (default PURPLE 0998).
+
+  --sensor-card-color RED --sensor-card-serial 1234
+        Light sensor on a different card (default PURPLE 0998).
+
+  --catch-delta 8
+        How much the light reading must rise to count as caught
+        (default 15). Lower it if the goalie doesn't set it off.
+
+  --speed 60 --turn-speed 40
+        Motor speeds in percent (default 40 and 30).
+
+  --tolerance 30
+        Accept notes that are this many Hz off (default 20).
+
+  --no-calibrate
+        Skip calibration and use fixed notes C4 D4 E4 F4 (G4 = GOAL).
+
+  --help
+        Show every option.
+
+
+--------------------------------------------------------------
+6. WHAT'S ON SCREEN
+--------------------------------------------------------------
+
+  Top left:   Heard: <pitch>   Car: <what the car is doing>
+  Top right:  ROLE | STATE | reason
+              light <reading> (caught > <threshold>)    <- ball only
+
+  States: WAITING (white) -> PLAYING (green) -> WON (yellow) or
+          LOST (red)
+
+
+--------------------------------------------------------------
+7. MQTT MESSAGES (both teams must use the same ones)
+--------------------------------------------------------------
+
+  Topic: ME193/Rogers   (broker: test.mosquitto.org)
+
+  start         game begins
+  ball_caught   ball's sensor tripped -> ball lost, goalie won
+  ball_scored   ball held GOAL         -> ball won, goalie lost
+
+  To change them, edit MSG_START, MSG_BALL_CAUGHT and
+  MSG_BALL_SCORED near the top of Whistling/world_cup.py.
+
+
+--------------------------------------------------------------
+8. IF SOMETHING'S WRONG
+--------------------------------------------------------------
+
+  Car won't move         -> Did you send "start"? Is it --dry-run?
+                            Did it print "Double Motor connected."?
+  "Heard" shows a pitch  -> Recalibrate (run without --use-saved).
+   but Car stays STOP
+  Plot is blank          -> Allow the microphone: System Settings ->
+                            Privacy & Security -> Microphone.
+  --use-saved error      -> world_cup.py has its own calibration file;
+                            run once without --use-saved.
+  Lost right at start    -> Something was in front of the light sensor.
+
+  Stop the program: close the plot window or press Ctrl+C.
+
+
+--------------------------------------------------------------
+SETTING UP ON ANOTHER MAC (one time)
+--------------------------------------------------------------
+
+  brew install portaudio
+  python3.12 -m venv venv
+  source venv/bin/activate
+  pip install matplotlib numpy pyaudio -r requirements.txt
