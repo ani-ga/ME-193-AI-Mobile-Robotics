@@ -6,15 +6,21 @@ noise filtering and live spectrogram). This adds the game around it:
     WAITING   the car ignores whistles until "start" arrives on ME193/Rogers
     PLAYING   whistle to drive
     WON/LOST  motors stop, whistles are ignored and a song plays
+              until the next "start", which begins a new round
+
+MQTT ("start" always comes from ME193/Rogers):
+  - Results are JSON on ME193/Rogers:  {"event": "goal", "team": "cucurella"}
+      goal = that team's ball scored,  fail = that team's ball was caught
+    Only messages whose "team" is the opponent (--team) count; others are
+    printed and ignored. Our ball publishes the same JSON with --my-team.
+  - Plain-text "goal" / "fail" on ME193/<opponent> are also accepted.
 
 Ball (calibrates a 5th note, GOAL):
-  - light sensor sees the goalie up close -> publish BALL_CAUGHT, death song
-  - hold the GOAL note for GOAL_HOLD_SECONDS -> publish BALL_SCORED, success song
+  - light sensor sees the goalie up close -> publish "fail", death song
+  - hold the GOAL note for GOAL_HOLD_SECONDS -> publish "goal", success song
 Goalie:
-  - hears BALL_CAUGHT -> success song
-  - hears BALL_SCORED -> death song
-
-The message strings below are placeholders -- agree on them with your opponent.
+  - opponent's "fail" -> success song
+  - opponent's "goal" -> death song
 
 The light sensor counts the ball as caught when its reflection reading rises
 --catch-delta above the baseline measured at startup for --catch-frames
@@ -26,10 +32,13 @@ Usage:
     python world_cup.py --role ball              # calibrate, connect car + sensor, wait for start
     python world_cup.py --role goalie --use-saved
     python world_cup.py --role ball --dry-run    # no motors or sensor
+    python world_cup.py --role goalie --team cucurella   # opponent is team cucurella
     python world_cup.py --send start             # publish a test message and exit
+    python world_cup.py --send goal --team cucurella     # pretend cucurella's ball scored
 """
 
 import argparse
+import json
 import queue
 import sys
 import threading
@@ -44,10 +53,11 @@ import note_drive as nd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mqttlib import BROKER, MQTTClient  # noqa: E402  (lives in the repo root)
 
-TOPIC = "ME193/Rogers"
+START_TOPIC = "ME193/Rogers"     # "start" and JSON results go here
+DEFAULT_MY_TEAM = "Ryan"         # our name in the JSON "team" field; change with --my-team
 MSG_START = "start"
-MSG_BALL_CAUGHT = "ball_caught"   # placeholder: the ball failed, the goalie wins
-MSG_BALL_SCORED = "ball_scored"   # placeholder: the ball scored, the goalie loses
+MSG_BALL_CAUGHT = "fail"   # the ball was caught: the goalie wins
+MSG_BALL_SCORED = "goal"   # the ball scored: the goalie loses
 
 GOAL_HOLD_SECONDS = 1.0           # hold GOAL this long so a stray note can't end the game
 SENSOR_BASELINE_SECONDS = 1.0
@@ -142,26 +152,46 @@ class LightSensor:
             self.sensor = None
 
 
+def result_json(event, team):
+    return json.dumps({"event": event, "team": team})
+
+
+def parse_result(msg):
+    """(event, team) from '{"event": "goal", "team": "cucurella"}', or
+    (None, None) if msg isn't a result in that form."""
+    try:
+        data = json.loads(msg)
+    except ValueError:
+        return None, None
+    if not isinstance(data, dict) or "event" not in data:
+        return None, None
+    return str(data["event"]).strip().lower(), str(data.get("team", "")).strip().lower()
+
+
 class Game:
     """World Cup rules on top of note_drive.run_live(). step() is called about
     25 times a second with the command that was heard and returns what the car
     should actually do (None = stop)."""
 
-    def __init__(self, role, mqtt, sensor):
+    def __init__(self, role, mqtt, sensor, opponent, my_team):
         self.role = role
         self.mqtt = mqtt
         self.sensor = sensor
+        self.opponent = opponent
+        self.my_team = my_team
+        team_topic = f"ME193/{opponent}"   # plain-text results from the opponent
         self.state = "WAITING"
         self.reason = f"waiting for '{MSG_START}'"
         self.goal_since = None
         # MQTT messages arrive on paho's thread; step() handles them on the plot's thread.
         self.messages = queue.Queue()
-        mqtt.subscribe(TOPIC, lambda topic, payload: self.messages.put(payload.strip().lower()))
+        for topic in {START_TOPIC, team_topic}:
+            mqtt.subscribe(topic, lambda topic, payload: self.messages.put((topic, payload.strip().lower())))
 
     def step(self, heard):
         while True:
             try:
-                self.on_message(self.messages.get_nowait())
+                self.on_message(*self.messages.get_nowait())
             except queue.Empty:
                 break
         # Read the sensor in every state so its value is on screen before the start.
@@ -184,24 +214,40 @@ class Game:
             return None
         return heard
 
-    def on_message(self, msg):
-        print(f"MQTT [{TOPIC}] {msg}")
-        if self.state == "WAITING" and msg == MSG_START:
-            self.state, self.reason = "PLAYING", "go!"
-            print("Start! Whistle to drive.")
-        elif self.role == "goalie" and self.state in ("WAITING", "PLAYING"):
-            if msg == MSG_BALL_CAUGHT:
-                self.finish(True, "caught the ball")
-            elif msg == MSG_BALL_SCORED:
-                self.finish(False, "the ball scored")
+    def on_message(self, topic, msg):
+        print(f"MQTT [{topic}] {msg}")
+        if msg == MSG_START and topic == START_TOPIC:
+            # Every "start" begins a fresh round, even after a win or loss.
+            restart = self.state != "WAITING"
+            self.state, self.reason = "PLAYING", "go!" if not restart else "new round -- go!"
+            self.goal_since = None
+            if self.sensor is not None:
+                self.sensor.count = 0
+            print("New round! Whistle to drive." if restart else "Start! Whistle to drive.")
+            return
+
+        event, team = parse_result(msg)
+        if event is None:
+            if topic == START_TOPIC:
+                return   # plain text on the shared topic has no team -- can't tell who sent it
+            event, team = msg, self.opponent.lower()
+        if team != self.opponent.lower():
+            print(f"  (ignored: from team '{team}', not our opponent '{self.opponent}')")
+            return
+        if self.role == "goalie" and self.state in ("WAITING", "PLAYING"):
+            if event == MSG_BALL_CAUGHT:
+                self.finish(True, f"caught {self.opponent}'s ball")
+            elif event == MSG_BALL_SCORED:
+                self.finish(False, f"{self.opponent} scored")
 
     def finish(self, won, reason, publish=None):
         self.state = "WON" if won else "LOST"
         self.reason = reason
         print(f"\n*** {self.role.upper()} {self.state}: {reason} ***")
         if publish:
-            self.mqtt.publish(TOPIC, publish)
-            print(f"Published '{publish}' to {TOPIC}.")
+            payload = result_json(publish, self.my_team)
+            self.mqtt.publish(START_TOPIC, payload)
+            print(f"Published {payload} to {START_TOPIC}.")
         play_song(SUCCESS_SONG if won else DEATH_SONG)
 
     def status(self):
@@ -215,10 +261,23 @@ class Game:
             self.sensor.close()
 
 
+def ask_opponent(args):
+    """The opponent's team name, from --team or asked at startup."""
+    while not args.team:
+        args.team = input("Opponent's team name (as it appears in their \"team\" field): ").strip()
+    return args.team
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--role", choices=["ball", "goalie"], help="Which side you're playing")
-    parser.add_argument("--send", metavar="MESSAGE", help=f"Just publish MESSAGE on {TOPIC} and exit (for testing)")
+    parser.add_argument("--team", default=None,
+                        help="Opponent's team name: only their goal/fail results count (asked at startup if omitted)")
+    parser.add_argument("--my-team", default=DEFAULT_MY_TEAM,
+                        help=f"Our team name, sent in the JSON results we publish (default {DEFAULT_MY_TEAM})")
+    parser.add_argument("--send", metavar="MESSAGE",
+                        help=f"Just publish MESSAGE to {START_TOPIC} and exit (for testing). "
+                             "'goal' / 'fail' are sent as JSON from --team, as if the opponent sent them")
     parser.add_argument("--sensor-card-color", default="PURPLE", help="Color Sensor connection card color (default PURPLE)")
     parser.add_argument("--sensor-card-serial", default="0998", help="Color Sensor connection card serial number (default 0998)")
     parser.add_argument("--catch-delta", type=float, default=15.0,
@@ -230,14 +289,19 @@ def main():
     args = parser.parse_args()
 
     if args.send:
+        payload = args.send
+        if payload.strip().lower() in (MSG_BALL_SCORED, MSG_BALL_CAUGHT):
+            payload = result_json(payload.strip().lower(), ask_opponent(args))
         with MQTTClient() as mqtt:
-            mqtt.publish(TOPIC, args.send)
+            mqtt.publish(START_TOPIC, payload)
             time.sleep(1)  # give the message time to reach the broker before disconnecting
-        print(f"Published '{args.send}' to {TOPIC}.")
+        print(f"Published {payload} to {START_TOPIC}.")
         return
     if args.role is None:
         parser.error("--role ball or --role goalie is required")
     nd.choose_streaming(args)
+    if args.link != "remote":   # the remote doesn't run the game
+        ask_opponent(args)
 
     commands = nd.COMMANDS + (["GOAL"] if args.role == "ball" else [])
     card_color = nd.parse_card_color(args.card_color) if args.card_color else None
@@ -262,8 +326,9 @@ def main():
 
     print(f"Connecting to MQTT broker {BROKER}...")
     with MQTTClient() as mqtt:
-        game = Game(args.role, mqtt, sensor)
-        print(f"Role: {args.role}. Waiting for '{MSG_START}' on {TOPIC}...")
+        game = Game(args.role, mqtt, sensor, args.team, args.my_team)
+        print(f"Role: {args.role} (team {args.my_team}) vs {args.team}. "
+              f"Waiting for '{MSG_START}' on {START_TOPIC}...")
         nd.run_live(detector, notes, car, args, game)
 
 

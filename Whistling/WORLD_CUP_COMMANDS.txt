@@ -169,13 +169,27 @@ Only the host needs to hear "start".
 7. MQTT MESSAGES (both teams must use the same ones)
 --------------------------------------------------------------
 
-  Topic: ME193/Rogers   (broker: test.mosquitto.org)
+  Broker: test.mosquitto.org
 
-  start         game begins
-  ball_caught   ball's sensor tripped -> ball lost, goalie won
-  ball_scored   ball held GOAL         -> ball won, goalie lost
+  All on topic ME193/Rogers:
 
-  To change them, edit MSG_START, MSG_BALL_CAUGHT and
+  start                                    new round (from any state)
+  {"event": "goal", "team": "<name>"}      that team's ball scored
+  {"event": "fail", "team": "<name>"}      that team's ball was caught
+
+  --team <name>     the opponent. Only results from that team
+                    count (asked at startup if omitted).
+  --my-team <name>  our name in the results our ball publishes
+                    (default Ryan).
+
+  Goalie: opponent's goal -> LOST, opponent's fail -> WON.
+  Plain-text "goal"/"fail" on ME193/<opponent> also work.
+
+  Test (pretend to be the opponent):
+    python Whistling/world_cup.py --send goal --team cucurella
+    python Whistling/world_cup.py --send fail --team cucurella
+
+  To change the words, edit MSG_START, MSG_BALL_CAUGHT and
   MSG_BALL_SCORED near the top of Whistling/world_cup.py.
 
 
