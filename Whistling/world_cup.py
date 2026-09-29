@@ -21,6 +21,7 @@ Ball (calibrates a 5th note, GOAL):
 Goalie:
   - opponent's "fail" -> success song
   - opponent's "goal" -> death song
+With two computers the remote laptop plays the same song as the host.
 
 The light sensor counts the ball as caught when its reflection reading rises
 --catch-delta above the baseline measured at startup for --catch-frames
@@ -71,6 +72,7 @@ nd.COMMAND_COLORS["GOAL"] = "#9b59b6"
 SUCCESS_SONG = [(523.25, 0.15), (659.25, 0.15), (783.99, 0.15), (1046.50, 0.4),
                 (0, 0.1), (783.99, 0.15), (1046.50, 0.6)]
 DEATH_SONG = [(493.88, 0.45), (466.16, 0.45), (440.00, 0.45), (415.30, 1.3)]  # wah wah wah waaah
+SONGS = {"success": SUCCESS_SONG, "death": DEATH_SONG}   # names the host streams to the remote
 
 GAME_COLORS = {"WAITING": "white", "PLAYING": "#2ecc71", "WON": "#f1c40f", "LOST": "#e74c3c"}
 
@@ -183,6 +185,7 @@ class Game:
         self.state = "WAITING"
         self.reason = f"waiting for '{MSG_START}'"
         self.goal_since = None
+        self.song = [0, None]   # [songs played, last song name]; streamed so the remote plays it too
         # MQTT messages arrive on paho's thread; step() handles them on the plot's thread.
         self.messages = queue.Queue()
         for topic in {START_TOPIC, team_topic}:
@@ -248,7 +251,9 @@ class Game:
             payload = result_json(publish, self.my_team)
             self.mqtt.publish(START_TOPIC, payload)
             print(f"Published {payload} to {START_TOPIC}.")
-        play_song(SUCCESS_SONG if won else DEATH_SONG)
+        name = "success" if won else "death"
+        self.song = [self.song[0] + 1, name]
+        play_song(SONGS[name])
 
     def status(self):
         text = f"{self.role.upper()} | {self.state} | {self.reason}"
@@ -312,10 +317,10 @@ def main():
     nd.focus_on_notes(detector, notes, args)
 
     if args.link == "remote":
-        # Just a second mic: the host laptop runs the car, sensor and game,
-        # and its game status shows up on this screen.
+        # Just a second mic: the host laptop runs the car, sensor and game;
+        # its game status shows up on this screen and its songs play here too.
         car = nd.Car(card_color, args.card_serial, args.speed, args.turn_speed, dry_run=True)
-        nd.run_live(detector, notes, car, args)
+        nd.run_live(detector, notes, car, args, on_host_song=lambda name: play_song(SONGS[name]))
         return
 
     car = nd.Car(card_color, args.card_serial, args.speed, args.turn_speed, args.dry_run)

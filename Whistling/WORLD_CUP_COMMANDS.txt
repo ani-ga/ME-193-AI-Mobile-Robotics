@@ -114,6 +114,7 @@ Answer 2 on both laptops, then:
 
 Both screens show two spectrograms: this mic (top) and the
 teammate's mic (bottom). Each laptop calibrates its own notes.
+When the game ends, the remote plays the same song as the host.
 
 Skip the questions with:
 

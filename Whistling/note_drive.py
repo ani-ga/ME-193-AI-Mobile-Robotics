@@ -574,12 +574,14 @@ class AudioLink:
         self.client.__exit__(None, None, None)
 
 
-def run_live(detector, notes, car, args, game=None):
+def run_live(detector, notes, car, args, game=None, on_host_song=None):
     """Listen, drive and show the live spectrogram until the window is closed.
 
     `game` is optional (see world_cup.py): game.step(heard_cmd) is called on
     every screen update and returns the command the car should actually do,
-    and game.status() returns (text, color) for an extra status box.
+    and game.status() returns (text, color) for an extra status box. If the
+    game has a `song` attribute ([count, name]), the host streams it and the
+    remote calls on_host_song(name) each time the count goes up.
 
     With args.computers == 2 a second panel shows the teammate's mic. On the
     host the car obeys this laptop's note, or else the teammate's; the remote
@@ -606,7 +608,7 @@ def run_live(detector, notes, car, args, game=None):
     audio_queue = queue.Queue()
     pending = np.zeros(0, dtype=np.float32)   # samples not yet consumed by a hop
     window_buf = np.zeros(WINDOW_SIZE, dtype=np.float32)
-    state = {"freq": None, "cmd": None}
+    state = {"freq": None, "cmd": None, "song_seen": None}
 
     def audio_callback(in_data, frame_count, time_info, status):
         if status:
@@ -666,6 +668,7 @@ def run_live(detector, notes, car, args, game=None):
             mate_cmd = link.teammate_cmd()
 
         game_status = None
+        song = None
         if is_host:
             heard = cmd or mate_cmd   # this laptop wins when both play a note
             drive = game.step(heard) if game is not None else heard
@@ -673,16 +676,23 @@ def run_live(detector, notes, car, args, game=None):
             car_text = drive or "STOP"
             if game is not None:
                 game_status = game.status()
+                song = getattr(game, "song", None)
         else:
             host = link.latest if link.connected else None
             drive = host.get("drive") if host else None
             car_text = (drive or "STOP") if host else "(host offline)"
             if host and host.get("status"):
                 game_status = tuple(host["status"])
+            if host and host.get("song") and on_host_song is not None:
+                count, name = host["song"]
+                # The first message only sets the count, so joining late doesn't replay an old song.
+                if state["song_seen"] is not None and count != state["song_seen"] and name:
+                    on_host_song(name)
+                state["song_seen"] = count
 
         if link is not None:
             link.send(new_cols, new_pitches, cmd,
-                      dict(info, drive=drive if is_host else None, status=game_status))
+                      dict(info, drive=drive if is_host else None, status=game_status, song=song))
             if link.connected:
                 mate.highlight(mate_cmd)
                 mate.set_status(f"Teammate heard: {format_pitch(link.last_pitch)}    -> {mate_cmd or '--'}",
